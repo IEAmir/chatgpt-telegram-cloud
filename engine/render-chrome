@@ -1,0 +1,17 @@
+#!/bin/bash
+# Chromium wrapper used as W2A_CHROME_PATH. Adds the flags needed to run
+# Chromium as root inside a small container, keeps the page "foreground"
+# (Xvfb never occludes it, but backgrounding heuristics stay disabled), and
+# caps memory pressure.
+exec /usr/bin/chromium \
+  --no-sandbox \
+  --disable-dev-shm-usage \
+  --disable-gpu \
+  --window-size=1200,800 \
+  --lang=en-US \
+  --disable-features=Translate,BackForwardCache \
+  --disable-background-timer-throttling \
+  --disable-backgrounding-occluded-windows \
+  --disable-renderer-backgrounding \
+  --mute-audio \
+  "$@"

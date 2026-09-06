@@ -1,0 +1,49 @@
+services:
+  # Engine: chatgpt-web2api (text via ChatGPT web) + pixel-bridge-mcp
+  # (images via ChatGPT web), one Chromium under Xvfb, public router.
+  - type: web
+    name: chatgpt-engine
+    runtime: docker
+    dockerfilePath: ./engine/Dockerfile
+    dockerContext: ./engine
+    plan: free
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: API_SECRET
+        generateValue: true
+      - key: W2A_LOG_LEVEL
+        value: INFO
+      # COOKIES_JSON (optional): base64 or raw JSON array of chatgpt.com
+      # cookies, exported from a logged-in browser (Cookie-Editor).
+
+  # Telegram bot: webhook + keep-alive, talks to the engine over HTTPS.
+  - type: web
+    name: chatgpt-telegram-bot
+    runtime: docker
+    dockerfilePath: ./telegram-bot/Dockerfile
+    dockerContext: ./telegram-bot
+    plan: free
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        value: "1757126617"
+      - key: ALLOWED_IDS
+        value: "1757126617"
+      - key: API_SECRET
+        fromService:
+          type: web
+          name: chatgpt-engine
+          property: API_SECRET
+      - key: ENGINE_URL
+        fromService:
+          type: web
+          name: chatgpt-engine
+          property: host
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: KEEP_ENGINE_WARM
+        value: "0"

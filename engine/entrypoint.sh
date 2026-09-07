@@ -31,6 +31,9 @@ if [ -n "$COOKIES_JSON" ]; then
 fi
 
 echo "[entrypoint] starting Xvfb on :99"
+# Render may restart the container PROCESS (not the filesystem): a stale
+# X99 lock would make Xvfb exit with "Server is already active for display 99".
+rm -f /tmp/.X99-lock /tmp/.X99-lock.test /tmp/.X11-unix/X99 2>/dev/null || true
 Xvfb :99 -screen 0 1280x800x24 -nolisten tcp &
 export DISPLAY=:99
 

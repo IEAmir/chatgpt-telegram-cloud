@@ -280,6 +280,20 @@ async def admin_page_info(request: "web.Request") -> "web.Response":
         return web.json_response({"error": f"CDP failed: {exc}"}, status=500)
 
 
+async def admin_auth_probe(request: "web.Request") -> "web.Response":
+    """Full /api/auth/session response + cookie presence, for diagnosing auth."""
+    if not _authorized(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    try:
+        page = await CdpPage().open()
+        session = await page.eval("(async()=>{try{const r=await fetch('/api/auth/session',{credentials:'include'});const t=await r.text();return t.slice(0,1500)}catch(e){return 'ERR:'+e.message}})()")
+        cookie_state = await page.eval("JSON.stringify({hasSessionToken: document.cookie.includes('session-token'), title: document.title, url: location.href})")
+        await page.close()
+        return web.json_response({"session_response": session, "page": json.loads(cookie_state) if isinstance(cookie_state, str) else cookie_state})
+    except Exception as exc:
+        return web.json_response({"error": f"CDP failed: {exc}"}, status=500)
+
+
 async def admin_restart_engine(request: "web.Request") -> "web.Response":
     if not _authorized(request):
         return web.json_response({"error": "unauthorized"}, status=401)
@@ -315,6 +329,7 @@ def main() -> None:
     app.router.add_get("/healthz", healthz)
     app.router.add_post("/admin/cookies", admin_cookies)
     app.router.add_get("/admin/page-info", admin_page_info)
+    app.router.add_get("/admin/auth-probe", admin_auth_probe)
     app.router.add_post("/admin/restart-engine", admin_restart_engine)
     app.router.add_post("/admin/restart-chrome", admin_restart_chrome)
     app.router.add_route("*", "/img/{tail:.*}", _proxy_img)

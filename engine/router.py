@@ -202,6 +202,11 @@ async def admin_cookies(request: "web.Request") -> "web.Response":
     # IP; dropping them lets the server-side Chrome earn fresh ones.
     skip = {"__cf_bm", "_cfuvid"}
     cookies = [c for c in cookies if c.get("name") not in skip]
+    # Strip control characters: Telegram paste-wrapping can inject raw
+    # newlines into long cookie values and Chrome rejects those outright.
+    for c in cookies:
+        c["value"] = "".join(ch for ch in c.get("value", "")
+                             if ch not in "\r\n\t")
 
     os.makedirs(os.path.dirname(COOKIE_FILE), exist_ok=True)
     with open(COOKIE_FILE, "w", encoding="utf-8") as f:

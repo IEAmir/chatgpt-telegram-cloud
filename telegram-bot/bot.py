@@ -108,17 +108,21 @@ def chunk_text(text: str, size: int = 3900) -> list[str]:
 
 # ── Pollinations (free, no-key) fallback ──────────────────────────────────
 async def pollinations_text(messages: list[dict]) -> str:
-    body = {"messages": messages[-16:], "model": "openai-fast"}
-    async with session.post(POLL_TEXT_URL, json=body,
-                            timeout=aiohttp.ClientTimeout(total=120)) as r:
+    """GET endpoint is the only reliably free path from datacenter IPs."""
+    convo = "\n".join(
+        f"[{'User' if m['role'] == 'user' else 'Assistant'}]: {m['content']}"
+        for m in messages[-12:]
+    )
+    prompt = (f"You are a helpful assistant. Reply in the user's language. "
+              f"Conversation:\n{convo}\n[Assistant]:")
+    url = f"{POLL_TEXT_URL}{quote(prompt)}?model=openai-fast&seed={int(time.time())}"
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as r:
         if r.status != 200:
             raise RuntimeError(f"pollinations text HTTP {r.status}")
-        data = await r.json(content_type=None)
-        ch = data.get("choices") or [{}]
-        msg = (ch[0].get("message") or {}).get("content") or ""
-        if not msg:
+        text = await r.text()
+        if not text.strip():
             raise RuntimeError("empty pollinations reply")
-        return msg
+        return text.strip()
 
 
 async def pollinations_image(prompt: str) -> bytes:

@@ -215,22 +215,44 @@ async def handle_cookies_payload(msg: Message, raw_bytes: bytes | None, text: st
     if not any("session-token" in n or "session" in n for n in names):
         await msg.answer("⚠️ به نظر نمی‌رسه کوکی نشست ChatGPT توش باشه (__Secure-next-auth.session-token). "
                          "ادامه می‌دم ولی ممکنه لاگین نشه.")
-    status, resp = await engine_request("POST", "/admin/cookies", json_body={"cookies": data}, timeout=180)
-    if status != 200:
-        await msg.answer(f"❌ موتور کوکی رو نپذیرفت (HTTP {status}): {resp}")
-        return
-    if resp.get("verified"):
+    note = await msg.answer("⏳ کوکی دریافت شد؛ روی موتور داره تزریق و تأیید می‌شه (تا ~۳ دقیقه)…")
+    try:
+        status, resp = await engine_request("POST", "/admin/cookies",
+                                            json_body={"cookies": data}, timeout=120)
+        if status != 200:
+            await msg.answer(f"❌ موتور کوکی رو نپذیرفت (HTTP {status}): {str(resp)[:300]}\n"
+                             "اگر موتور خوابیده بود، چند لحظه بعد مجدد /setcookies و ارسال کن.")
+            return
+        # Injection runs as a background job on the engine — poll for the verdict.
+        deadline = time.monotonic() + 210
+        result = {}
+        while time.monotonic() < deadline:
+            await asyncio.sleep(12)
+            st, result = await engine_request("GET", "/admin/cookies-status", timeout=45)
+            if st == 200 and not result.get("running") and result.get("steps"):
+                break
+        verified = result.get("verified")
+        steps = result.get("steps") or []
+        w2a_ok = result.get("web2api_ok")
         cookie_cache = data
         cookie_cache_name = f"cookies-{int(time.time())}.json"
-        last_boot_id = None  # force re-sync on next health tick
-        await msg.answer("✅ کوکی تزریق شد و لاگین ChatGPT تأیید شد!\nحالا می‌تونی چت کنی و /img بزنی.")
-    else:
-        cookie_cache = data
-        cookie_cache_name = f"cookies-{int(time.time())}.json"
-        await msg.answer("⚠️ کوکی ذخیره شد ولی تأیید لاگین ناموفق بود.\n"
-                         "احتمالاً کوکی منقضی شده یا ChatGPT چالش امنیتی نشون داده. "
-                         "چند دقیقه دیگه /status بزن؛ اگر حل نشد کوکی تازه بفرست.\n\n"
-                         f"خروجی موتور:\n{resp.get('output', '')[-500:]}")
+        last_boot_id = None  # lets the auto-heal loop re-sync on next engine boot
+        if verified and w2a_ok:
+            await msg.answer("✅ لاگین ChatGPT تأیید شد و موتور سالمه!\n"
+                             "حالا هر پیامی بفرست جواب می‌گیری؛ /img هم تصویر می‌سازه.")
+        elif verified:
+            await msg.answer("✅ لاگین تأیید شد؛ موتور داره روشن می‌شه — دو دقیقه بعد /status بزن.")
+        else:
+            tail = "\n".join(str(s) for s in steps[-4:])
+            await msg.answer("⚠️ کوکی تزریق شد ولی تأیید لاگین ناموفق بود.\n"
+                             "معمولاً یعنی توکن همین لحظه‌ها توسط مرورگر خودت rotate شده یا OpenAI موقتاً محدود کرده.\n"
+                             "در chatgpt.com لاگین تازه کن، مرورگر خودت رو ببند، Export تازه بگیر و دوباره بفرست.\n\n"
+                             f"آخرین وضعیت:\n{tail}")
+    finally:
+        try:
+            await note.delete()
+        except Exception:
+            pass
 
 
 # ── Text chat ─────────────────────────────────────────────────────────────

@@ -184,7 +184,74 @@ class CdpPage:
 
 # ── Admin routes ─────────────────────────────────────────────────────────
 
+INJECT_STATE: dict = {"running": False, "started_at": 0.0, "finished_at": 0.0,
+                      "verified": False, "steps": [], "error": None}
+
+
+async def _inject_cookies_job(app: "web.Application", cookies: list) -> None:
+    """Background: inject cookies via CDP, poll auth, restart web2api."""
+    import time
+    INJECT_STATE.update(running=True, started_at=time.time(), finished_at=0.0,
+                        verified=False, steps=[], error=None)
+    steps = INJECT_STATE["steps"]
+    try:
+        try:
+            await _run(["pkill", "-f", "chatgpt-web2api start"], timeout=20)
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+        page = None
+        try:
+            page = await CdpPage().open()
+            steps.append(f"tab: {page.target.get('url')}")
+            await page.send("Page.navigate", {"url": "https://chatgpt.com/"})
+            await asyncio.sleep(10)
+            for c in cookies:
+                cdp_cookie = {
+                    "name": c.get("name", ""),
+                    "value": c.get("value", ""),
+                    "domain": c.get("domain", ".chatgpt.com"),
+                    "path": c.get("path", "/"),
+                    "secure": c.get("secure", True),
+                    "httpOnly": c.get("httpOnly", False),
+                }
+                sm = str(c.get("sameSite", "")).lower()
+                cdp_cookie["sameSite"] = {"lax": "Lax", "strict": "Strict",
+                                          "no_restriction": "None"}.get(sm, "Lax")
+                if c.get("expirationDate"):
+                    cdp_cookie["expires"] = float(c["expirationDate"])
+                await page.send("Network.setCookie", cdp_cookie)
+            steps.append(f"set {len(cookies)} cookies")
+            await page.send("Page.reload")
+            for i in range(6):
+                await asyncio.sleep(8)
+                state = await page.eval("JSON.stringify({t:document.title,prompt:!!document.querySelector('#prompt-textarea')})")
+                steps.append(f"poll{i}: {state}")
+                verdict = await page.eval("(async()=>{try{const r=await fetch('/api/auth/session',{credentials:'include'});const d=await r.json();return d.accessToken?('OK:'+(d.user?.name||'')):('FAIL:'+JSON.stringify(d).slice(0,90))}catch(e){return 'ERR:'+e.message}})()")
+                steps.append(f"auth{i}: {str(verdict)[:90]}")
+                if isinstance(verdict, str) and verdict.startswith("OK:"):
+                    INJECT_STATE["verified"] = True
+                    break
+        except Exception as exc:
+            steps.append(f"error: {exc}")
+        finally:
+            if page:
+                await page.close()
+        health = await _wait_w2a_healthy(app, deadline_s=90)
+        steps.append(f"web2api_healthy: {health.get('healthy')}")
+    except Exception as exc:
+        INJECT_STATE["error"] = str(exc)
+    finally:
+        INJECT_STATE["running"] = False
+        INJECT_STATE["finished_at"] = time.time()
+
+
 async def admin_cookies(request: "web.Request") -> "web.Response":
+    """Accept cookies and START background injection; returns immediately.
+
+    Long synchronous handlers get cut off by Render's proxy (~100s), so the
+    real work runs as a task — poll GET /admin/cookies-status for the result.
+    """
     if not _authorized(request):
         return web.json_response({"error": "unauthorized"}, status=401)
     try:
@@ -212,55 +279,22 @@ async def admin_cookies(request: "web.Request") -> "web.Response":
     with open(COOKIE_FILE, "w", encoding="utf-8") as f:
         json.dump(cookies, f)
 
-    try:
-        await _run(["pkill", "-f", "chatgpt-web2api start"], timeout=20)
-    except Exception:
-        pass
-    await asyncio.sleep(2)
+    asyncio.create_task(_inject_cookies_job(request.app, cookies))
+    return web.json_response({"ok": True, "started": True, "count": len(cookies)})
 
-    steps: list[str] = []
-    verified = False
-    page = None
-    try:
-        page = await CdpPage().open()
-        steps.append(f"tab: {page.target.get('url')}")
-        await page.send("Page.navigate", {"url": "https://chatgpt.com/"})
-        await asyncio.sleep(10)
-        for c in cookies:
-            cdp_cookie = {
-                "name": c.get("name", ""),
-                "value": c.get("value", ""),
-                "domain": c.get("domain", ".chatgpt.com"),
-                "path": c.get("path", "/"),
-                "secure": c.get("secure", True),
-                "httpOnly": c.get("httpOnly", False),
-            }
-            sm = str(c.get("sameSite", "")).lower()
-            cdp_cookie["sameSite"] = {"lax": "Lax", "strict": "Strict",
-                                      "no_restriction": "None"}.get(sm, "Lax")
-            if c.get("expirationDate"):
-                cdp_cookie["expires"] = float(c["expirationDate"])
-            await page.send("Network.setCookie", cdp_cookie)
-        steps.append(f"set {len(cookies)} cookies")
-        await page.send("Page.reload")
-        for i in range(6):
-            await asyncio.sleep(8)
-            state = await page.eval("JSON.stringify({t:document.title,u:location.href,prompt:!!document.querySelector('#prompt-textarea'),cf:!!document.querySelector('iframe[src*=\"challenges.cloudflare\"]')})")
-            steps.append(f"poll{i}: {state}")
-            verdict = await page.eval("(async()=>{try{const r=await fetch('/api/auth/session',{credentials:'include'});const d=await r.json();return d.accessToken?('OK:'+(d.user?.name||'')):('FAIL:'+JSON.stringify(d).slice(0,100))}catch(e){return 'ERR:'+e.message}})()")
-            steps.append(f"auth{i}: {str(verdict)[:100]}")
-            if isinstance(verdict, str) and verdict.startswith("OK:"):
-                verified = True
-                break
-    except Exception as exc:
-        steps.append(f"error: {exc}")
-    finally:
-        if page:
-            await page.close()
 
-    health = await _wait_w2a_healthy(request.app, deadline_s=90)
-    return web.json_response({"ok": True, "verified": verified,
-                              "steps": steps[-14:], "web2api": health})
+async def admin_cookies_status(request: "web.Request") -> "web.Response":
+    if not _authorized(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    ok, detail = await _probe(request.app, f"{W2A}/health", timeout=8)
+    return web.json_response({
+        "running": INJECT_STATE["running"],
+        "verified": INJECT_STATE["verified"],
+        "steps": INJECT_STATE["steps"][-14:],
+        "error": INJECT_STATE["error"],
+        "web2api_ok": ok,
+        "web2api_detail": detail,
+    })
 
 
 async def admin_page_info(request: "web.Request") -> "web.Response":
@@ -330,6 +364,7 @@ def main() -> None:
     app.router.add_post("/admin/cookies", admin_cookies)
     app.router.add_get("/admin/page-info", admin_page_info)
     app.router.add_get("/admin/auth-probe", admin_auth_probe)
+    app.router.add_get("/admin/cookies-status", admin_cookies_status)
     app.router.add_post("/admin/restart-engine", admin_restart_engine)
     app.router.add_post("/admin/restart-chrome", admin_restart_chrome)
     app.router.add_route("*", "/img/{tail:.*}", _proxy_img)

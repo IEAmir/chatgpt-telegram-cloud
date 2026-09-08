@@ -1,8 +1,8 @@
 """Telegram bot = ChatGPT (free web) on Telegram.
 
 Text goes to chatgpt-web2api (OpenAI-compatible REST), images to pixel-bridge
-(via the engine's HTTP shim). Runs as a Render free web service: webhook for
-Telegram + a self-ping keep-alive so the instance stays warm.
+(via the engine's HTTP shim). Falls back to Pollinations (free, no key) when
+the ChatGPT engine is unavailable.
 """
 import asyncio
 import base64
@@ -33,6 +33,9 @@ PORT = int(os.environ.get("PORT", "10000"))
 KEEP_ENGINE_WARM = os.environ.get("KEEP_ENGINE_WARM", "0") == "1"
 IMG_PROVIDER = os.environ.get("IMG_PROVIDER", "chatgpt")
 SELF_URL = RENDER_EXTERNAL_URL or f"http://127.0.0.1:{PORT}"
+POLLINATIONS_FALLBACK = os.environ.get("POLLINATIONS_FALLBACK", "1") != "0"
+POLL_TEXT_URL = "https://text.pollinations.ai/"
+POLL_IMG_URL = "https://image.pollinations.ai/prompt/"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("bot")
@@ -46,7 +49,7 @@ cookie_cache: list | None = None
 cookie_cache_name: str | None = None
 last_boot_id: str | None = None
 awaiting_cookies: set[int] = set()
-awaiting_edit_caption: dict[int, tuple[str, str]] = {}  # user_id -> (file_id, file_path)
+awaiting_edit_caption: dict[int, tuple[str, str]] = {}
 
 session: aiohttp.ClientSession | None = None
 
@@ -103,12 +106,35 @@ def chunk_text(text: str, size: int = 3900) -> list[str]:
     return out
 
 
+# ── Pollinations (free, no-key) fallback ──────────────────────────────────
+async def pollinations_text(messages: list[dict]) -> str:
+    body = {"messages": messages[-16:], "model": "openai", "private": True}
+    async with session.post(POLL_TEXT_URL, json=body,
+                            timeout=aiohttp.ClientTimeout(total=120)) as r:
+        if r.status != 200:
+            raise RuntimeError(f"pollinations text HTTP {r.status}")
+        data = await r.json(content_type=None)
+        ch = data.get("choices") or [{}]
+        msg = (ch[0].get("message") or {}).get("content") or ""
+        if not msg:
+            raise RuntimeError("empty pollinations reply")
+        return msg
+
+
+async def pollinations_image(prompt: str) -> bytes:
+    url = f"{POLL_IMG_URL}{quote(prompt)}?width=1024&height=1024&nologo=true"
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=180)) as r:
+        if r.status != 200:
+            raise RuntimeError(f"pollinations image HTTP {r.status}")
+        return await r.read()
+
+
 # ── Commands ──────────────────────────────────────────────────────────────
 WELCOME = (
-    "سلام! 👋 من چت‌بات تلگرامی‌ات هستم که پشت صحنه از ChatGPT وب (رایگان) استفاده می‌کنه.\n\n"
+    "سلام! 👋 من چت‌بات تلگرامی‌ات هستم.\n\n"
     "• هر متنی بفرستی جواب می‌گیرم (مکالمه با حافظه)\n"
     "• /img <توضیح> → تولید تصویر\n"
-    "• عکس بفرست + توضیح تغییرات در کپشن → ویرایش تصویر\n"
+    "• عکس + کپشن → ویرایش تصویر\n"
     "• /new → شروع مکالمه جدید\n"
     "• /model → لیست مدل‌ها و انتخاب مدل\n"
     "• /status → وضعیت موتور\n"
@@ -171,11 +197,12 @@ async def cmd_status(msg: Message):
         return
     w2a = h.get("web2api", {}).get("detail", {})
     lines = [
-        f"status: {h.get('ok') and '🟢' or '🟡'}",
+        f"status: {'🟢' if h.get('ok') else '🟡'}",
         f"web2api: {w2a.get('status', '?')} | cdp_connected: {w2a.get('cdp_connected', '?')}",
         f"chrome_cdp: {'🟢' if h.get('chrome_cdp', {}).get('ok') else '🔴'}",
         f"pixel_bridge: {'🟢' if h.get('pixel_bridge', {}).get('ok') else '🔴'}",
         f"cookies_file: {'بله' if h.get('cookies_file') else 'نمی‌دونم'}",
+        f"fallback_pollinations: {'روشن' if POLLINATIONS_FALLBACK else 'خاموش'}",
     ]
     st, img = await engine_request("GET", f"/img/session/{IMG_PROVIDER}", timeout=60)
     if st == 200:
@@ -186,7 +213,6 @@ async def cmd_status(msg: Message):
 
 @dp.message(Command("setcookies"))
 async def cmd_setcookies(msg: Message):
-    global cookie_cache, cookie_cache_name
     if not allowed(msg.from_user.id) and msg.from_user.id != OWNER_ID:
         return
     if OWNER_ID and msg.from_user.id != OWNER_ID:
@@ -223,7 +249,6 @@ async def handle_cookies_payload(msg: Message, raw_bytes: bytes | None, text: st
             await msg.answer(f"❌ موتور کوکی رو نپذیرفت (HTTP {status}): {str(resp)[:300]}\n"
                              "اگر موتور خوابیده بود، چند لحظه بعد مجدد /setcookies و ارسال کن.")
             return
-        # Injection runs as a background job on the engine — poll for the verdict.
         deadline = time.monotonic() + 210
         result = {}
         while time.monotonic() < deadline:
@@ -236,7 +261,7 @@ async def handle_cookies_payload(msg: Message, raw_bytes: bytes | None, text: st
         w2a_ok = result.get("web2api_ok")
         cookie_cache = data
         cookie_cache_name = f"cookies-{int(time.time())}.json"
-        last_boot_id = None  # lets the auto-heal loop re-sync on next engine boot
+        last_boot_id = None
         if verified and w2a_ok:
             await msg.answer("✅ لاگین ChatGPT تأیید شد و موتور سالمه!\n"
                              "حالا هر پیامی بفرست جواب می‌گیری؛ /img هم تصویر می‌سازه.")
@@ -255,6 +280,19 @@ async def handle_cookies_payload(msg: Message, raw_bytes: bytes | None, text: st
             pass
 
 
+@dp.message(Command("cookies_help"))
+async def cookies_help(msg: Message):
+    if not allowed(msg.from_user.id):
+        return
+    await msg.answer(
+        "راهنمای کوکی:\n"
+        "1) روی گوشی/کامپیوترت وارد chatgpt.com شو (لاگین باشی)\n"
+        "2) افزونه Cookie-Editor رو نصب کن و روی chatgpt.com بزن Export (فرمت JSON)\n"
+        "3) فایل JSON رو همین‌جا بفرست (یا بعد از /setcookies)\n"
+        "کوکی‌ها حدوداً هر ۲ هفته منقضی می‌شن و باید دوباره بفرستی."
+    )
+
+
 # ── Text chat ─────────────────────────────────────────────────────────────
 async def do_chat(msg: Message, text: str):
     uid = msg.from_user.id
@@ -268,7 +306,12 @@ async def do_chat(msg: Message, text: str):
             "messages": hist[-24:],
         }
         status, data = await engine_request("POST", "/v1/chat/completions", json_body=payload, timeout=300)
-        if status != 200:
+        if status == 200:
+            content = data["choices"][0]["message"]["content"]
+        elif POLLINATIONS_FALLBACK:
+            log.info("engine chat HTTP %s — using pollinations fallback", status)
+            content = await pollinations_text(hist[-16:])
+        else:
             err = ""
             if isinstance(data, dict):
                 err = str(data.get("error", data))[:400]
@@ -276,15 +319,19 @@ async def do_chat(msg: Message, text: str):
             await msg.answer(f"⚠️ خطای موتور (HTTP {status}):\n{err or 'بدون جزئیات'}\n\n"
                              "چند لحظه صبر کن و دوباره بفرست. /status هم وضعیت رو نشون می‌ده.")
             return
-        content = data["choices"][0]["message"]["content"]
         hist.append({"role": "assistant", "content": content})
         for part in chunk_text(content):
             await msg.answer(part)
-    except asyncio.TimeoutError:
-        await msg.answer("⏱️ پاسخ بیش از حد طول کشید. ChatGPT وب گاهی کُنده؛ دوباره امتحان کن.")
-    except aiohttp.ClientError as exc:
-        await msg.answer(f"⚠️ اتصال به موتور برقرار نشد: {exc}\n"
-                         "اگر موتور تازه بیدار شده ۱-۲ دقیقه صبر کن.")
+    except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+        if POLLINATIONS_FALLBACK:
+            try:
+                content = await pollinations_text(hist[-16:])
+                for part in chunk_text(content):
+                    await msg.answer(part)
+                return
+            except Exception:
+                pass
+        await msg.answer(f"⚠️ اتصال به موتور برقرار نشد: {exc}")
     finally:
         stop.set()
         t.cancel()
@@ -300,6 +347,14 @@ async def generate_and_send(msg: Message, prompt: str):
             timeout=200,
         )
         if status != 200:
+            if POLLINATIONS_FALLBACK:
+                try:
+                    img_bytes = await pollinations_image(prompt)
+                    await msg.answer_photo(BufferedInputFile(img_bytes, filename="image.png"),
+                                           caption=(prompt[:900] + "…"))
+                    return
+                except Exception:
+                    pass
             await msg.answer(f"⚠️ خطای موتور تصویر (HTTP {status}): {str(job)[:300]}")
             return
         deadline = time.monotonic() + 540
@@ -317,13 +372,19 @@ async def generate_and_send(msg: Message, prompt: str):
             else:
                 await msg.answer("تصویر ساخته شد ولی دانلودش ناموفق بود.")
             return
+        if POLLINATIONS_FALLBACK:
+            try:
+                img_bytes = await pollinations_image(prompt)
+                await msg.answer_photo(BufferedInputFile(img_bytes, filename="image.png"),
+                                       caption=(prompt[:900] + "…"))
+                return
+            except Exception:
+                pass
         if job.get("status") == "failed":
             err = job.get("error", "بدون جزئیات")
-            await msg.answer(f"❌ تولید تصویر ناموفق بود:\n{err[:800]}\n\n"
-                             "اگر پیام رد شدن (refusal) بوده، پرامپت رو عوض کن؛ "
-                             "اگر لاگین مشکل داره /status بزن.")
-            return
-        await msg.answer("⏱️ تولید تصویر خیلی طول کشید. بعداً /status بزن یا دوباره امتحان کن.")
+            await msg.answer(f"❌ تولید تصویر ناموفق بود:\n{err[:800]}")
+        else:
+            await msg.answer("⏱️ تولید تصویر خیلی طول کشید.")
     finally:
         try:
             await status_note.delete()
@@ -343,6 +404,14 @@ async def edit_and_send(msg: Message, file_id: str, instructions: str):
                        "provider": IMG_PROVIDER, "wait_seconds": 150},
             timeout=200,
         )
+        if status != 200 and POLLINATIONS_FALLBACK:
+            try:
+                img_bytes = await pollinations_image(instructions)
+                await msg.answer_photo(BufferedInputFile(img_bytes, filename="edited.png"),
+                                       caption=instructions[:900])
+                return
+            except Exception:
+                pass
         if status != 200:
             await msg.answer(f"⚠️ خطای موتور (HTTP {status}): {str(job)[:300]}")
             return
@@ -358,7 +427,7 @@ async def edit_and_send(msg: Message, file_id: str, instructions: str):
                 await msg.answer_photo(BufferedInputFile(img_bytes, filename="edited.png"),
                                        caption=instructions[:900])
                 return
-        await msg.answer(f"❌ ویرایش ناموفق بود: {str(job.get('error', job))[:600]}")
+        await msg.answer("❌ ویرایش ناموفق بود.")
     finally:
         try:
             await note.delete()
@@ -391,19 +460,6 @@ async def on_photo(msg: Message):
     f = await bot.get_file(photo.file_id)
     awaiting_edit_caption[uid] = (photo.file_id, f.file_path)
     await msg.answer("عکس گرفتم. حالا بنویس چه تغییری می‌خوای (همین پیام بعدی به‌عنوان دستور ویرایش استفاده می‌شه).")
-
-
-@dp.message(Command("cookies_help"))
-async def cookies_help(msg: Message):
-    if not allowed(msg.from_user.id):
-        return
-    await msg.answer(
-        "راهنمای کوکی:\n"
-        "1) روی گوشی/کامپیوترت وارد chatgpt.com شو (لاگین باشی)\n"
-        "2) افزونه Cookie-Editor رو نصب کن و روی chatgpt.com بزن Export (فرمت JSON)\n"
-        "3) فایل JSON رو همین‌جا بفرست (یا بعد از /setcookies)\n"
-        "کوکی‌ها حدوداً هر ۲ هفته منقضی می‌شن و باید دوباره بفرستی."
-    )
 
 
 @dp.message(F.document)
@@ -447,7 +503,6 @@ async def h_index(_):
 
 
 async def h_warm(_):
-    # Self-ping target; also warm the engine when enabled.
     if KEEP_ENGINE_WARM:
         try:
             await engine_request("GET", "/healthz", timeout=25)
@@ -462,8 +517,6 @@ async def h_webhook(request: web.Request):
     try:
         payload = await request.json()
         update = Update.model_validate(payload, context={"bot": bot})
-        # Process asynchronously: long completions must not delay the HTTP 200
-        # (Telegram retries webhooks that respond slowly).
         asyncio.create_task(dp.feed_update(bot, update))
     except Exception as exc:
         log.exception("webhook error: %s", exc)
@@ -480,7 +533,6 @@ async def keep_alive_loop():
                 r.status
         except Exception:
             pass
-        # Auto-heal: if the engine restarted and we hold cookies, re-inject them.
         if cookie_cache:
             try:
                 status, h = await engine_request("GET", "/healthz", timeout=30)
@@ -488,9 +540,8 @@ async def keep_alive_loop():
                 if status == 200 and boot and boot != last_boot_id:
                     log.info("engine boot_id changed (%s) — re-injecting cookies", boot)
                     st, resp = await engine_request("POST", "/admin/cookies",
-                                                    json_body={"cookies": cookie_cache}, timeout=180)
-                    log.info("auto cookie inject: %s verified=%s", st,
-                             isinstance(resp, dict) and resp.get("verified"))
+                                                    json_body={"cookies": cookie_cache}, timeout=120)
+                    log.info("auto cookie inject: %s", st)
                     if st == 200:
                         last_boot_id = boot
             except Exception as exc:

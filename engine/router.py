@@ -328,6 +328,36 @@ async def admin_auth_probe(request: "web.Request") -> "web.Response":
         return web.json_response({"error": f"CDP failed: {exc}"}, status=500)
 
 
+async def admin_tabs_probe(request: "web.Request") -> "web.Response":
+    """Evaluate the auth fetch in EVERY open page tab — finds which tab fails."""
+    if not _authorized(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    results = []
+    try:
+        async with ClientSession() as s:
+            async with s.get(f"{CDP}/json/list") as r:
+                targets = await r.json()
+        pages = [t for t in targets if t.get("type") == "page"]
+        for t in pages:
+            entry = {"url": t.get("url", "")[:90], "title": t.get("title", "")[:40]}
+            try:
+                ws = await websockets.connect(t["webSocketDebuggerUrl"],
+                                              max_size=16 * 1024 * 1024)
+                page = CdpPage()
+                page.ws = ws
+                page.target = t
+                info = await page.eval("JSON.stringify({ready:document.readyState, prompt:!!document.querySelector('#prompt-textarea'), tok: (await fetch('/api/auth/session',{credentials:'include'}).then(r=>r.json()).then(d=>d.accessToken?('YES:'+d.accessToken.length):'NO_TOKEN')).catch(e=>'ERR:'+e.message)})",
+                                       timeout=15)
+                await ws.close()
+                entry["probe"] = json.loads(info) if isinstance(info, str) else info
+            except Exception as exc:
+                entry["probe"] = f"ERROR: {exc}"
+            results.append(entry)
+        return web.json_response({"tabs": results})
+    except Exception as exc:
+        return web.json_response({"error": f"CDP failed: {exc}"}, status=500)
+
+
 async def admin_restart_engine(request: "web.Request") -> "web.Response":
     if not _authorized(request):
         return web.json_response({"error": "unauthorized"}, status=401)
@@ -364,6 +394,7 @@ def main() -> None:
     app.router.add_post("/admin/cookies", admin_cookies)
     app.router.add_get("/admin/page-info", admin_page_info)
     app.router.add_get("/admin/auth-probe", admin_auth_probe)
+    app.router.add_get("/admin/tabs-probe", admin_tabs_probe)
     app.router.add_get("/admin/cookies-status", admin_cookies_status)
     app.router.add_post("/admin/restart-engine", admin_restart_engine)
     app.router.add_post("/admin/restart-chrome", admin_restart_chrome)

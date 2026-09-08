@@ -6,7 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # display, since headless triggers ChatGPT's bot detection), fonts for
 # multilingual rendering (the bot is Persian-first), and process tools.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates gnupg xvfb chromium \
+        curl ca-certificates gnupg xvfb chromium bash \
         fonts-liberation fonts-noto-core fonts-noto-color-emoji \
         procps tini \
  && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
@@ -27,10 +27,9 @@ RUN cd /app/pixel-bridge && npm ci && npm run build \
  && chmod +x mcp-http-bridge.mjs
 
 COPY gen_config.py entrypoint.sh router.py /app/
-RUN chmod +x /app/entrypoint.sh
-
 COPY render-chrome /usr/local/bin/render-chrome
-RUN chmod +x /usr/local/bin/render-chrome
+RUN chmod +x /app/entrypoint.sh /usr/local/bin/render-chrome \
+ && sed -i 's/\r$//' /app/entrypoint.sh /usr/local/bin/render-chrome
 
 ENV W2A_CHROME_PATH=/usr/local/bin/render-chrome \
     W2A_USER_DATA_DIR=/data/chrome-profile \
@@ -48,4 +47,4 @@ VOLUME /data
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/app/entrypoint.sh"]
+CMD ["/usr/bin/bash", "/app/entrypoint.sh"]

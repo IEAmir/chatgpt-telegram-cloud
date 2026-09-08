@@ -1,20 +1,18 @@
 #!/bin/bash
-# Chromium wrapper used as W2A_CHROME_PATH. Tuned for a 512MB container:
-# - --no-sandbox (root), --disable-dev-shm-usage (small /dev/shm)
-# - single renderer process per site + heap caps to stop memory sprawl
-# - window kept small; rendering is DOM-driven so viewport size doesn't matter
-# - backgrounding heuristics off so the page behaves "foreground" under Xvfb
+# Chromium wrapper used as W2A_CHROME_PATH. Tuned hard for a 512MB container:
+# shared single renderer + small V8 heap + no site isolation processes.
 exec /usr/bin/chromium \
   --no-sandbox \
   --disable-dev-shm-usage \
   --disable-gpu \
-  --window-size=900,700 \
+  --window-size=800,600 \
   --lang=en-US \
   --renderer-process-limit=1 \
   --process-per-site \
-  --js-flags="--max-old-space-size=128" \
-  --disk-cache-size=33554432 \
-  --disable-features=Translate,BackForwardCache,CalculateNativeWinOcclusion,HeavyAdIntervention \
+  --disable-site-isolation-trials \
+  --js-flags="--max-old-space-size=96 --max-semi-space-size=16" \
+  --disk-cache-size=16777216 \
+  --disable-features=Translate,BackForwardCache,HeavyAdIntervention,IsolateOrigins,site-per-process,CalculateNativeWinOcclusion \
   --disable-background-timer-throttling \
   --disable-backgrounding-occluded-windows \
   --disable-renderer-backgrounding \

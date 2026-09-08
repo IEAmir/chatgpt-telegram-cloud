@@ -39,8 +39,24 @@ function log(...args) {
   console.log(`[bridge ${new Date().toISOString()}]`, ...args);
 }
 
+const MCP_IDLE_KILL_MS = Number(process.env.MCP_IDLE_KILL_MS || 120000);
+let lastUsedAt = Date.now();
+let idleTimer = null;
+
+function touchIdle() {
+  lastUsedAt = Date.now();
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    if (child && Date.now() - lastUsedAt >= MCP_IDLE_KILL_MS) {
+      log("idle timeout — stopping MCP child to free memory");
+      try { child.kill("SIGTERM"); } catch {}
+    }
+  }, MCP_IDLE_KILL_MS + 5000);
+}
+
 function startMcp() {
   if (child && !child.killed) return;
+  touchIdle();
   log("spawning MCP server:", MCP_CMD, MCP_ARGS.join(" "));
   child = spawn(MCP_CMD, MCP_ARGS, {
     cwd: "/app/pixel-bridge",
@@ -90,6 +106,7 @@ function startMcp() {
 }
 
 async function mcpRequest(method, params, timeoutMs = 0) {
+  touchIdle();
   startMcp();
   if (!connected) {
     await initialize();

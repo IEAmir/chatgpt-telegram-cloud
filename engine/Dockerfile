@@ -42,7 +42,7 @@ ENV W2A_CHROME_PATH=/usr/local/bin/render-chrome \
     DISPLAY=:99 \
     PIXEL_BRIDGE_HOME=/data/pixel-bridge \
     PIXEL_BRIDGE_CDP_URL=http://127.0.0.1:9222 \
-    NODE_OPTIONS=--max-old-space-size=384
+    NODE_OPTIONS=--max-old-space-size=128
 
 VOLUME /data
 EXPOSE 8080

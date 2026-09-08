@@ -1,8 +1,7 @@
 """Telegram bot = ChatGPT (free web) on Telegram.
 
 Text goes to chatgpt-web2api (OpenAI-compatible REST), images to pixel-bridge
-(via the engine's HTTP shim). Falls back to Pollinations (free, no key) when
-the ChatGPT engine is unavailable.
+(via the engine's HTTP shim).
 """
 import asyncio
 import base64
@@ -33,9 +32,6 @@ PORT = int(os.environ.get("PORT", "10000"))
 KEEP_ENGINE_WARM = os.environ.get("KEEP_ENGINE_WARM", "0") == "1"
 IMG_PROVIDER = os.environ.get("IMG_PROVIDER", "chatgpt")
 SELF_URL = RENDER_EXTERNAL_URL or f"http://127.0.0.1:{PORT}"
-POLLINATIONS_FALLBACK = os.environ.get("POLLINATIONS_FALLBACK", "1") != "0"
-POLL_TEXT_URL = "https://text.pollinations.ai/"
-POLL_IMG_URL = "https://image.pollinations.ai/prompt/"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("bot")
@@ -104,33 +100,6 @@ def chunk_text(text: str, size: int = 3900) -> list[str]:
         text = text[cut:].lstrip("\n")
     out.append(text)
     return out
-
-
-# ── Pollinations (free, no-key) fallback ──────────────────────────────────
-async def pollinations_text(messages: list[dict]) -> str:
-    """GET endpoint is the only reliably free path from datacenter IPs."""
-    convo = "\n".join(
-        f"[{'User' if m['role'] == 'user' else 'Assistant'}]: {m['content']}"
-        for m in messages[-12:]
-    )
-    prompt = (f"You are a helpful assistant. Reply in the user's language. "
-              f"Conversation:\n{convo}\n[Assistant]:")
-    url = f"{POLL_TEXT_URL}{quote(prompt)}?model=openai-fast&seed={int(time.time())}"
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as r:
-        if r.status != 200:
-            raise RuntimeError(f"pollinations text HTTP {r.status}")
-        text = await r.text()
-        if not text.strip():
-            raise RuntimeError("empty pollinations reply")
-        return text.strip()
-
-
-async def pollinations_image(prompt: str) -> bytes:
-    url = f"{POLL_IMG_URL}{quote(prompt)}?width=1024&height=1024&nologo=true"
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=180)) as r:
-        if r.status != 200:
-            raise RuntimeError(f"pollinations image HTTP {r.status}")
-        return await r.read()
 
 
 # ── Commands ──────────────────────────────────────────────────────────────
@@ -206,7 +175,6 @@ async def cmd_status(msg: Message):
         f"chrome_cdp: {'🟢' if h.get('chrome_cdp', {}).get('ok') else '🔴'}",
         f"pixel_bridge: {'🟢' if h.get('pixel_bridge', {}).get('ok') else '🔴'}",
         f"cookies_file: {'بله' if h.get('cookies_file') else 'نمی‌دونم'}",
-        f"fallback_pollinations: {'روشن' if POLLINATIONS_FALLBACK else 'خاموش'}",
     ]
     st, img = await engine_request("GET", f"/img/session/{IMG_PROVIDER}", timeout=60)
     if st == 200:
@@ -312,9 +280,6 @@ async def do_chat(msg: Message, text: str):
         status, data = await engine_request("POST", "/v1/chat/completions", json_body=payload, timeout=300)
         if status == 200:
             content = data["choices"][0]["message"]["content"]
-        elif POLLINATIONS_FALLBACK:
-            log.info("engine chat HTTP %s — using pollinations fallback", status)
-            content = await pollinations_text(hist[-16:])
         else:
             err = ""
             if isinstance(data, dict):
@@ -327,14 +292,6 @@ async def do_chat(msg: Message, text: str):
         for part in chunk_text(content):
             await msg.answer(part)
     except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
-        if POLLINATIONS_FALLBACK:
-            try:
-                content = await pollinations_text(hist[-16:])
-                for part in chunk_text(content):
-                    await msg.answer(part)
-                return
-            except Exception:
-                pass
         await msg.answer(f"⚠️ اتصال به موتور برقرار نشد: {exc}")
     finally:
         stop.set()
@@ -351,14 +308,6 @@ async def generate_and_send(msg: Message, prompt: str):
             timeout=200,
         )
         if status != 200:
-            if POLLINATIONS_FALLBACK:
-                try:
-                    img_bytes = await pollinations_image(prompt)
-                    await msg.answer_photo(BufferedInputFile(img_bytes, filename="image.png"),
-                                           caption=(prompt[:900] + "…"))
-                    return
-                except Exception:
-                    pass
             await msg.answer(f"⚠️ خطای موتور تصویر (HTTP {status}): {str(job)[:300]}")
             return
         deadline = time.monotonic() + 540
@@ -376,14 +325,6 @@ async def generate_and_send(msg: Message, prompt: str):
             else:
                 await msg.answer("تصویر ساخته شد ولی دانلودش ناموفق بود.")
             return
-        if POLLINATIONS_FALLBACK:
-            try:
-                img_bytes = await pollinations_image(prompt)
-                await msg.answer_photo(BufferedInputFile(img_bytes, filename="image.png"),
-                                       caption=(prompt[:900] + "…"))
-                return
-            except Exception:
-                pass
         if job.get("status") == "failed":
             err = job.get("error", "بدون جزئیات")
             await msg.answer(f"❌ تولید تصویر ناموفق بود:\n{err[:800]}")
@@ -408,14 +349,6 @@ async def edit_and_send(msg: Message, file_id: str, instructions: str):
                        "provider": IMG_PROVIDER, "wait_seconds": 150},
             timeout=200,
         )
-        if status != 200 and POLLINATIONS_FALLBACK:
-            try:
-                img_bytes = await pollinations_image(instructions)
-                await msg.answer_photo(BufferedInputFile(img_bytes, filename="edited.png"),
-                                       caption=instructions[:900])
-                return
-            except Exception:
-                pass
         if status != 200:
             await msg.answer(f"⚠️ خطای موتور (HTTP {status}): {str(job)[:300]}")
             return

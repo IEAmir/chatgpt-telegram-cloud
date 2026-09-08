@@ -108,7 +108,7 @@ def chunk_text(text: str, size: int = 3900) -> list[str]:
 
 # ── Pollinations (free, no-key) fallback ──────────────────────────────────
 async def pollinations_text(messages: list[dict]) -> str:
-    body = {"messages": messages[-16:], "model": "openai-fast", "private": True}
+    body = {"messages": messages[-16:], "model": "openai-fast"}
     async with session.post(POLL_TEXT_URL, json=body,
                             timeout=aiohttp.ClientTimeout(total=120)) as r:
         if r.status != 200:
